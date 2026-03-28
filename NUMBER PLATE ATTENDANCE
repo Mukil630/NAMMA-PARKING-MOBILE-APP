@@ -1,0 +1,638 @@
+"""
+🚗 COMPLETE NUMBER PLATE DETECTOR - ALL-IN-ONE
+================================================
+Camera → Detect → Auto-Capture → OCR → Display
+
+Features:
+✅ YOLOv8 AI detection (auto-downloads model)
+✅ EasyOCR text extraction
+✅ Auto-capture with flash effect
+✅ Live number overlay on camera
+✅ Confidence scoring
+✅ Session summary with all detections
+✅ Fallback detection if YOLO fails
+
+Installation:
+-----------
+py -3.13 -m pip install opencv-python-headless easyocr ultralytics pillow torch torchvision
+
+Usage:
+------
+py -3.13 plate_detector_complete.py
+
+Controls:
+---------
+q - Quit
+s - Manual save
+Auto-capture happens automatically when plate detected!
+
+Author: Built for Mukil by Mapla 🔥
+"""
+
+import cv2
+import numpy as np
+from datetime import datetime
+import os
+from pathlib import Path
+import time
+import sqlite3
+import re
+import csv
+import winsound
+
+# Try importing AI libraries
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    print("⚠️ YOLOv8 not available, using basic detection")
+    YOLO_AVAILABLE = False
+
+try:
+    import easyocr
+    OCR_AVAILABLE = True
+except ImportError:
+    print("⚠️ EasyOCR not available, OCR disabled")
+    OCR_AVAILABLE = False
+
+
+class NumberPlateDetector:
+    """Complete number plate detection system"""
+    
+    def __init__(self):
+        """Initialize all components"""
+        print("\n" + "="*50)
+        print("🚗 NUMBER PLATE DETECTOR PRO")
+        print("="*50 + "\n")
+        
+        # Create output directory
+        self.output_dir = Path("captures")
+        self.output_dir.mkdir(exist_ok=True)
+        print(f"📁 Output directory: {self.output_dir.absolute()}\n")
+        
+        # Setup Safety CSV Log
+        self.csv_log_path = self.output_dir / "safety_logs.csv"
+        # Write header if file doesn't exist
+        if not self.csv_log_path.exists():
+            with open(self.csv_log_path, mode='w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(["Timestamp", "Plate_Number", "Status", "Confidence"])
+        
+        
+        # Initialize YOLO model
+        self.model = None
+        if YOLO_AVAILABLE:
+            print("📦 Loading YOLOv8 model...")
+            try:
+                self.model = YOLO('yolov8n.pt')
+                print("✅ YOLO model loaded successfully!")
+            except Exception as e:
+                print(f"⚠️ YOLO failed to load: {e}")
+                print("   Using fallback detection method")
+        
+        # Initialize OCR
+        self.reader = None
+        if OCR_AVAILABLE:
+            print("📖 Loading EasyOCR engine...")
+            try:
+                self.reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+                print("✅ OCR engine loaded successfully!")
+            except Exception as e:
+                print(f"⚠️ OCR failed to load: {e}")
+        
+        # Detection state
+        self.last_capture_time = 0
+        self.capture_cooldown = 3.0  # seconds between auto-captures (increased)
+        self.detected_plates = []
+        self.current_plate_text = None
+        self.last_saved_plate = None  # Track last saved plate
+        self.flash_frames_remaining = 0
+        
+        # UI colors (BGR format)
+        self.COLOR_GREEN = (0, 255, 0)
+        self.COLOR_ORANGE = (0, 165, 255)
+        self.COLOR_WHITE = (255, 255, 255)
+        self.COLOR_BLACK = (0, 0, 0)
+        self.COLOR_RED = (0, 0, 255)
+        
+        print("\n" + "="*50)
+        print("✅ ALL SYSTEMS READY!")
+        print("="*50 + "\n")
+
+    def log_safety_csv(self, plate, status, confidence):
+        """Append detection result to safety CSV log"""
+        try:
+            with open(self.csv_log_path, mode='a', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                    plate, 
+                    status, 
+                    f"{confidence*100:.1f}%"
+                ])
+        except Exception as e:
+            print(f"⚠️ Error writing to CSV: {e}")
+
+    def validate_indian_plate(self, text):
+        """
+        Safety Feature: Check if the plate matches the Indian standard format.
+        Format: 2 Letters, 2 Numbers, 1-2 Letters, 4 Numbers (e.g., TN 57 AD 3604)
+        Returns True if valid, False if it's a potential fake plate.
+        """
+        if not text:
+            return False
+            
+        # Remove spaces to simplify regex matching
+        cleaned_text = ''.join(c for c in text if c.isalnum()).upper()
+        
+        # Regex pattern: 2 letters, 2 numbers, 1 or 2 letters, 4 numbers
+        pattern = r"^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$"
+        
+        return bool(re.match(pattern, cleaned_text))
+    
+    def detect_plate_yolo(self, frame):
+        """Detect plate using YOLOv8"""
+        if self.model is None:
+            return None, 0.0
+        
+        try:
+            results = self.model(frame, verbose=False)
+            
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    confidence = float(box.conf[0])
+                    
+                    # Filter by confidence
+                    if confidence > 0.25:
+                        return (x1, y1, x2, y2), confidence
+        except Exception as e:
+            print(f"⚠️ YOLO detection error: {e}")
+        
+        return None, 0.0
+    
+    def detect_plate_contour(self, frame):
+        """Fallback: Detect plate using contour analysis"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Preprocessing
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 200)
+        
+        # Find contours
+        contours, _ = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Sort by area, get top candidates
+        sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+        
+        for contour in sorted_contours:
+            perimeter = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.018 * perimeter, True)
+            
+            # Look for rectangles
+            if len(approx) == 4:
+                x, y, w, h = cv2.boundingRect(approx)
+                aspect_ratio = w / float(h)
+                
+                # Typical plate dimensions
+                if 2.0 < aspect_ratio < 5.5 and w > 80 and h > 20:
+                    return (x, y, x+w, y+h), 0.6
+        
+        return None, 0.0
+    
+    def detect_plate_haar(self, frame):
+        """Fallback: Detect plate using Haar Cascade"""
+        cascade_path = "haarcascade_russian_plate_number.xml"
+        if os.path.exists(cascade_path):
+            try:
+                plate_cascade = cv2.CascadeClassifier(cascade_path)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # Detect plates
+                plates = plate_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                for (x, y, w, h) in plates:
+                    return (x, y, x+w, y+h), 0.7  # 70% static confidence for Haar
+            except Exception as e:
+                print(f"⚠️ Haar Cascade error: {e}")
+        return None, 0.0
+
+    def extract_text_from_plate(self, plate_image):
+        """Extract text using OCR with preprocessing"""
+        if self.reader is None or plate_image is None:
+            return None
+        
+        try:
+            # Resize image to make it larger for EasyOCR (2x zoom helps a lot)
+            plate_image_resized = cv2.resize(plate_image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            
+            # Use multiple preprocessing methods and keep the best result
+            candidates = []
+            
+            # Method 1: Original Resized Image
+            res1 = self.reader.readtext(plate_image_resized, allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', detail=0)
+            if res1: candidates.append(''.join(res1))
+            
+            # Method 2: Grayscale + CLAHE + Thresholding
+            gray = cv2.cvtColor(plate_image_resized, cv2.COLOR_BGR2GRAY)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            denoised = cv2.fastNlMeansDenoising(enhanced)
+            _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            res2 = self.reader.readtext(binary, allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', detail=0)
+            if res2: candidates.append(''.join(res2))
+            
+            # Method 3: Bilateral Filtering (removes noise while keeping edges)
+            blur = cv2.bilateralFilter(gray, 11, 17, 17)
+            res3 = self.reader.readtext(blur, allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ', detail=0)
+            if res3: candidates.append(''.join(res3))
+
+            # Pick the longest valid alphanumeric string
+            best_text = ""
+            for text in candidates:
+                cleaned = ''.join(c for c in text if c.isalnum())
+                if len(cleaned) > len(best_text):
+                    best_text = cleaned
+            
+            # We need at least 4 characters to assume it's a real plate
+            if len(best_text) < 4:
+                return None
+                
+            # Formatting
+            if len(best_text) >= 8:
+                formatted = f"{best_text[:2]} {best_text[2:4]} {best_text[4:6]} {best_text[6:]}"
+                return formatted.strip().upper()
+            return best_text.strip().upper()
+        
+        except Exception as e:
+            print(f"⚠️ OCR error: {e}")
+        
+        return None
+    
+    def save_detection(self, frame, plate_region, plate_text):
+        """Save captured frame and plate crop"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save full frame
+        frame_filename = f"frame_{timestamp}.jpg"
+        frame_path = self.output_dir / frame_filename
+        cv2.imwrite(str(frame_path), frame)
+        
+        # Save plate crop
+        plate_path = None
+        if plate_region is not None:
+            x1, y1, x2, y2 = plate_region
+            plate_crop = frame[y1:y2, x1:x2]
+            plate_filename = f"plate_{timestamp}.jpg"
+            plate_path = self.output_dir / plate_filename
+            cv2.imwrite(str(plate_path), plate_crop)
+        
+        print(f"📸 CAPTURED: {plate_text or 'Unknown'} → {frame_filename}")
+        
+        return frame_path, plate_path
+        
+    def update_attendance(self, plate_text):
+        """Update attendance database with the detected plate"""
+        try:
+            conn = sqlite3.connect('attendance.db')
+            c = conn.cursor()
+            
+            # Ensure tables exist
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS vehicles (
+                    plate TEXT PRIMARY KEY,
+                    owner_name TEXT DEFAULT 'Unknown',
+                    vehicle_type TEXT DEFAULT 'Car'
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS attendance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plate TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    time_in TEXT,
+                    time_out TEXT,
+                    entry_count INTEGER DEFAULT 1
+                )
+            ''')
+            
+            now = datetime.now()
+            current_date = now.strftime('%Y-%m-%d')
+            current_time = now.strftime('%H:%M:%S')
+            
+            # Ensure the vehicle is in the vehicles table
+            c.execute('INSERT OR IGNORE INTO vehicles (plate) VALUES (?)', (plate_text,))
+            
+            # Check if an attendance record exists for today
+            c.execute('SELECT id, entry_count FROM attendance WHERE plate = ? AND date = ?', (plate_text, current_date))
+            record = c.fetchone()
+            
+            if record:
+                # Update existing record (time_out and entry_count)
+                record_id, entry_count = record
+                c.execute('''
+                    UPDATE attendance 
+                    SET time_out = ?, entry_count = ? 
+                    WHERE id = ?
+                ''', (current_time, entry_count + 1, record_id))
+                status = "Updated existing record"
+            else:
+                # Insert new record
+                c.execute('''
+                    INSERT INTO attendance (plate, date, time_in) 
+                    VALUES (?, ?, ?)
+                ''', (plate_text, current_date, current_time))
+                status = "Created new record"
+            
+            conn.commit()
+            conn.close()
+            print(f"✅ Attendance Logged: {plate_text} at {current_time} ({status})")
+            
+        except Exception as e:
+            print(f"⚠️ Database Error logging attendance for {plate_text}: {e}")
+    
+    def draw_detection_ui(self, frame, plate_region, plate_text, confidence):
+        """Draw all UI elements on frame"""
+        h, w = frame.shape[:2]
+        display = frame.copy()
+        
+        # Flash effect
+        if self.flash_frames_remaining > 0:
+            overlay = np.ones_like(display) * 255
+            alpha = 0.4
+            display = cv2.addWeighted(display, 1-alpha, overlay, alpha, 0)
+            self.flash_frames_remaining -= 1
+        
+        # Draw plate bounding box
+        if plate_region is not None:
+            x1, y1, x2, y2 = plate_region
+            
+            # Choose color based on detection
+            box_color = self.COLOR_GREEN if plate_text else self.COLOR_ORANGE
+            
+            # Main rectangle
+            cv2.rectangle(display, (x1, y1), (x2, y2), box_color, 3)
+            
+            # Corner markers for style
+            corner_len = 25
+            thickness = 5
+            
+            # Top-left
+            cv2.line(display, (x1, y1), (x1 + corner_len, y1), box_color, thickness)
+            cv2.line(display, (x1, y1), (x1, y1 + corner_len), box_color, thickness)
+            
+            # Top-right
+            cv2.line(display, (x2, y1), (x2 - corner_len, y1), box_color, thickness)
+            cv2.line(display, (x2, y1), (x2, y1 + corner_len), box_color, thickness)
+            
+            # Bottom-left
+            cv2.line(display, (x1, y2), (x1 + corner_len, y2), box_color, thickness)
+            cv2.line(display, (x1, y2), (x1, y2 - corner_len), box_color, thickness)
+            
+            # Bottom-right
+            cv2.line(display, (x2, y2), (x2 - corner_len, y2), box_color, thickness)
+            cv2.line(display, (x2, y2), (x2, y2 - corner_len), box_color, thickness)
+            
+            # Confidence label
+            conf_text = f"{confidence*100:.1f}%"
+            cv2.putText(display, conf_text, (x1, y1-10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2)
+        
+        # Top panel for detected text
+        if plate_text:
+            panel_height = 100
+            
+            # Dark background
+            overlay = display.copy()
+            cv2.rectangle(overlay, (0, 0), (w, panel_height), self.COLOR_BLACK, -1)
+            display = cv2.addWeighted(display, 0.3, overlay, 0.7, 0)
+            
+            # Check format to determine color (Safety Feature)
+            is_valid = self.validate_indian_plate(plate_text)
+            status_color = self.COLOR_GREEN if is_valid else self.COLOR_RED
+            
+            # Draw border (Green for valid, Red for fake)
+            cv2.rectangle(display, (0, 0), (w, panel_height), status_color, 4)
+            
+            # Plate number text
+            text = f"PLATE: {plate_text}"
+            if not is_valid:
+                text += " [FAKE ALERT]"
+                
+            font_scale = 1.0 if not is_valid else 1.8
+            thickness = 3 if not is_valid else 4
+            
+            # Center the text
+            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)[0]
+            text_x = (w - text_size[0]) // 2
+            text_y = (panel_height + text_size[1]) // 2
+            
+            # Draw text with shadow
+            cv2.putText(display, text, (text_x+2, text_y+2),
+                       cv2.FONT_HERSHEY_DUPLEX, font_scale, self.COLOR_BLACK, thickness+2)
+            cv2.putText(display, text, (text_x, text_y),
+                       cv2.FONT_HERSHEY_DUPLEX, font_scale, self.COLOR_WHITE, thickness)
+        
+        # Status indicator
+        status_y = h - 30
+        
+        if plate_text:
+            status = "✓ DETECTED"
+            status_color = self.COLOR_GREEN
+        else:
+            status = "● SCANNING..."
+            status_color = self.COLOR_ORANGE
+        
+        cv2.putText(display, status, (15, status_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 3)
+        
+        # Detection count
+        count_text = f"Total: {len(self.detected_plates)}"
+        cv2.putText(display, count_text, (15, status_y - 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.COLOR_WHITE, 2)
+        
+        # Instructions
+        instructions = "Press 'Q' to quit | 'S' to save manually"
+        cv2.putText(display, instructions, (15, h - 70),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.COLOR_WHITE, 2)
+        
+        return display
+    
+    def run(self):
+        """Main detection loop"""
+        print("📹 Opening camera...")
+        cap = cv2.VideoCapture(0)
+        
+        if not cap.isOpened():
+            print("❌ ERROR: Cannot open camera!")
+            print("   Check if camera is connected and not in use")
+            return
+        
+        # Set camera resolution
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        
+        print("✅ Camera opened successfully!")
+        print("\n" + "="*50)
+        print("LIVE FEED STARTING...")
+        print("="*50 + "\n")
+        
+        while True:
+            ret, frame = cap.read()
+            
+            if not ret:
+                print("❌ Failed to grab frame")
+                break
+            
+            # Detect plate region
+            plate_region, confidence = None, 0.0
+            
+            # Try YOLO first
+            if self.model is not None:
+                plate_region, confidence = self.detect_plate_yolo(frame)
+            
+            # Try Haar Cascade
+            if plate_region is None:
+                plate_region, confidence = self.detect_plate_haar(frame)
+            
+            # Fallback to contour detection
+            if plate_region is None:
+                plate_region, confidence = self.detect_plate_contour(frame)
+            
+            # Extract text if plate detected
+            plate_text = None
+            if plate_region is not None:
+                x1, y1, x2, y2 = plate_region
+                
+                # Crop plate region
+                plate_crop = frame[y1:y2, x1:x2]
+                
+                # Run OCR
+                plate_text = self.extract_text_from_plate(plate_crop)
+                
+                # Auto-capture logic
+                if plate_text and len(plate_text) > 3:
+                    current_time = time.time()
+                    
+                    # Check if this is a different plate than last saved
+                    is_new_plate = (self.last_saved_plate is None or 
+                                   plate_text != self.last_saved_plate)
+                    
+                    # Check cooldown
+                    cooldown_passed = current_time - self.last_capture_time > self.capture_cooldown
+                    
+                    # Save only if new plate OR cooldown passed
+                    if is_new_plate and cooldown_passed:
+                        is_valid_format = self.validate_indian_plate(plate_text)
+                        
+                        status_str = "VALID" if is_valid_format else "FAKE ALERT"
+                        
+                        # Clear screen and print clearly
+                        print("\n" + "⭐"*30)
+                        print(f"🚘 SCANNED NUMBER PLATE: >>> {plate_text} <<<")
+                        
+                        if is_valid_format:
+                            print("✅ Status: VALID INDIAN FORMAT")
+                        else:
+                            print("🚨 🚨 🚨 WARNING: POTENTIAL FAKE PLATE 🚨 🚨 🚨")
+                            print("Initiative: 'Fighting Fake, Staying Safe'")
+                            # Play an audible alarm beep for fake plates!
+                            try:
+                                winsound.Beep(1000, 500) # Frequency 1000Hz, 500ms duration
+                            except Exception:
+                                pass # In case winsound is not supported (e.g. non-Windows)
+                            
+                        print("⭐"*30 + "\n")
+                        
+                        # Save detection
+                        self.save_detection(frame, plate_region, plate_text)
+                        
+                        # Log attendance
+                        self.update_attendance(plate_text)
+                        
+                        # Save to CSV Log
+                        self.log_safety_csv(plate_text, status_str, confidence)
+                        
+                        # Update state
+                        self.last_capture_time = current_time
+                        self.last_saved_plate = plate_text
+                        self.flash_frames_remaining = 10
+                        self.current_plate_text = plate_text
+                        
+                        # Store in history
+                        self.detected_plates.append({
+                            'text': plate_text,
+                            'time': datetime.now(),
+                            'confidence': confidence
+                        })
+            
+            # Draw UI
+            display_frame = self.draw_detection_ui(
+                frame, 
+                plate_region, 
+                plate_text or self.current_plate_text,
+                confidence
+            )
+            
+            # Show window
+            cv2.imshow('Number Plate Detector Pro', display_frame)
+            
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q') or key == ord('Q'):
+                print("\n👋 Shutting down...")
+                break
+            
+            elif key == ord('s') or key == ord('S'):
+                # Manual save
+                if plate_region is not None:
+                    self.save_detection(frame, plate_region, plate_text or "MANUAL")
+                    self.flash_frames_remaining = 10
+                else:
+                    print("⚠️ No plate detected to save!")
+        
+        # Cleanup
+        cap.release()
+        cv2.destroyAllWindows()
+        
+        # Print session summary
+        print("\n" + "="*50)
+        print("📊 SESSION SUMMARY")
+        print("="*50)
+        print(f"\nTotal plates detected: {len(self.detected_plates)}")
+        
+        if self.detected_plates:
+            print("\nDetections:")
+            for i, plate in enumerate(self.detected_plates, 1):
+                time_str = plate['time'].strftime('%H:%M:%S')
+                conf_str = f"{plate['confidence']*100:.1f}%"
+                print(f"  {i}. {plate['text']:20s} - {time_str} (confidence: {conf_str})")
+        else:
+            print("\nNo plates were detected in this session")
+        
+        print(f"\n💾 All captures saved to: {self.output_dir.absolute()}")
+        print("="*50 + "\n")
+
+
+def main():
+    """Entry point"""
+    try:
+        detector = NumberPlateDetector()
+        detector.run()
+    
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Interrupted by user (Ctrl+C)")
+    
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\nTroubleshooting:")
+        print("1. Make sure camera is not in use by another app")
+        print("2. Check if all dependencies are installed:")
+        print("   py -3.13 -m pip install opencv-python-headless easyocr ultralytics")
+        print("3. Run from terminal, not VS Code debugger")
+
+
+if __name__ == "__main__":
+    main()
